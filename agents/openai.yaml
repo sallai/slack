@@ -1,0 +1,4 @@
+interface:
+  display_name: "Slack"
+  short_description: "Use Slack through a bundled CLI"
+  default_prompt: "Use $slack to search, read, export, or update Slack content through the bundled CLI."

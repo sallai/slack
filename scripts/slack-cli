@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+API_BASE = "https://slack.com/api"
+SLACK_ENV_FILES = [
+    Path.home() / ".slack" / "env",
+    Path.home() / ".slack" / "slack.env",
+    Path.home() / ".slack" / ".env",
+]
+AUTH_SETUP_ERRORS = {
+    "account_inactive",
+    "invalid_auth",
+    "missing_scope",
+    "not_allowed_token_type",
+    "not_authed",
+    "token_expired",
+    "token_revoked",
+}
+SLACK_USER_APP_MANIFEST_YAML = """display_information:
+  name: Local Slack CLI
+  description: Local command-line Slack access using a user OAuth token
+  background_color: "#2f2f2f"
+
+oauth_config:
+  redirect_urls:
+    - https://example.com/slack/oauth/callback
+  scopes:
+    user:
+      - bookmarks:read
+      - bookmarks:write
+      - channels:history
+      - channels:read
+      - channels:write
+      - chat:write
+      - emoji:read
+      - files:read
+      - files:write
+      - groups:history
+      - groups:read
+      - groups:write
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - mpim:write
+      - pins:read
+      - pins:write
+      - reactions:read
+      - reactions:write
+      - search:read
+      - team:read
+      - users:read
+      - users:read.email
+
+settings:
+  token_rotation_enabled: false
+"""
+
+
+class SlackError(RuntimeError):
+    def __init__(self, method: str, message: str, response: dict[str, Any] | None = None) -> None:
+        self.method = method
+        self.response = response or {}
+        super().__init__(f"Slack API {method}: {message}")
+
+
+class SlackClient:
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+    def get(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.request(method, params=params, http_method="GET")
+
+    def post(self, method: str, body: dict[str, Any] | None = None, form: bool = False) -> dict[str, Any]:
+        return self.request(method, params=body, http_method="POST", form=form)
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        http_method: str = "POST",
+        form: bool = False,
+    ) -> dict[str, Any]:
+        method = normalize_method(method)
+        params = clean_params(params or {})
+        url = f"{API_BASE}/{method}"
+        data = None
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        if http_method == "GET":
+            if params:
+                url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
+        elif form:
+            data = urllib.parse.urlencode(params, doseq=True).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            data = json.dumps(params).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+
+        request = urllib.request.Request(url, data=data, method=http_method, headers=headers)
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                retry_after = error.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    time.sleep(int(retry_after))
+                    return self.request(method, params=params, http_method=http_method, form=form)
+
+            payload = error.read().decode("utf-8", errors="replace")
+            raise SlackError(method, f"HTTP {error.code} {error.reason}: {payload}") from error
+
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except json.JSONDecodeError as error:
+            raise SlackError(method, f"non-JSON response: {payload}") from error
+
+        if parsed.get("ok") is False:
+            message = parsed.get("error", "ok_false")
+            needed = parsed.get("needed")
+            provided = parsed.get("provided")
+            if needed:
+                message = f"{message}; needed={needed}; provided={provided}"
+            raise SlackError(method, message, parsed)
+
+        return parsed
+
+    def collect_cursor(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        result_key: str | None = None,
+        limit: int | None = None,
+        http_method: str = "GET",
+    ) -> list[Any]:
+        params = dict(params or {})
+        results: list[Any] = []
+        cursor = params.get("cursor")
+
+        while True:
+            remaining = None if limit is None else max(1, limit - len(results))
+            params["limit"] = min(200, remaining) if remaining is not None else params.get("limit", 200)
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params.pop("cursor", None)
+
+            page = self.get(method, params) if http_method == "GET" else self.post(method, params)
+            key = result_key or first_list_key(page)
+            if key:
+                results.extend(page.get(key, []))
+            else:
+                results.append(page)
+
+            if limit is not None and len(results) >= limit:
+                return results[:limit]
+
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                return results
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    try:
+        if not getattr(args, "requires_auth", True):
+            return args.func(None, args)
+
+        load_env_files([Path(path).expanduser() for path in args.env_file] if args.env_file else SLACK_ENV_FILES)
+        token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN") or os.environ.get("SLACK_TOKEN")
+        if not token:
+            print(build_slack_setup_text(), file=sys.stdout)
+            return 1
+
+        client = SlackClient(token)
+        return args.func(client, args)
+    except (SlackError, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
+        if isinstance(error, SlackError) and is_auth_setup_error(error):
+            print(str(error), file=sys.stderr)
+            print(build_slack_setup_text(), file=sys.stdout)
+            return 1
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="slack-cli",
+        description="Single-file Slack Web API CLI using ~/.slack/env credentials.",
+    )
+    parser.add_argument(
+        "--env-file",
+        action="append",
+        help="Credential env file to load. Defaults to ~/.slack/env and compatible fallbacks.",
+    )
+    subparsers = parser.add_subparsers(required=True)
+
+    add_setup_parser(subparsers)
+    add_me_parser(subparsers)
+    add_api_parser(subparsers)
+    add_conversation_parser(subparsers)
+    add_chat_parser(subparsers)
+    add_search_parser(subparsers)
+    add_user_parser(subparsers)
+    add_file_parser(subparsers)
+    add_reaction_parser(subparsers)
+    add_pin_parser(subparsers)
+    add_bookmark_parser(subparsers)
+    add_team_parser(subparsers)
+    add_emoji_parser(subparsers)
+
+    return parser
+
+
+def add_setup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("setup", help="Print user-token OAuth setup instructions and an app manifest.")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--manifest-only", action="store_true", help="Print only the Slack App Manifest YAML.")
+    output.add_argument("--env-only", action="store_true", help="Print only the local credential-file instructions.")
+    parser.set_defaults(func=cmd_setup, requires_auth=False)
+
+
+def add_me_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("me", help="Run auth.test for the active token.")
+    parser.set_defaults(func=cmd_me)
+
+
+def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("api", help="Call any Slack Web API method.")
+    parser.add_argument("http_method", choices=["GET", "POST"])
+    parser.add_argument("method", help="Slack method such as auth.test, or /api/auth.test.")
+    parser.add_argument("--data", help="JSON request body, @file.json, or - for stdin.")
+    parser.add_argument("--param", action="append", default=[], help="Add a scalar parameter as key=value.")
+    parser.add_argument("--form", action="store_true", help="POST as x-www-form-urlencoded instead of JSON.")
+    parser.add_argument("--paginate", action="store_true", help="Collect cursor-paginated results.")
+    parser.add_argument("--result-key", help="Result list key for pagination, e.g. channels, messages, files.")
+    parser.add_argument("--limit", type=int, help="Maximum total paginated results.")
+    parser.set_defaults(func=cmd_api)
+
+
+def add_conversation_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    conv = subparsers.add_parser("conversation", aliases=["conversations", "channel"], help="Conversation/channel operations.")
+    conv_sub = conv.add_subparsers(required=True)
+
+    list_parser = conv_sub.add_parser("list", help="List conversations.")
+    list_parser.add_argument("--types", default="public_channel,private_channel,mpim,im")
+    list_parser.add_argument("--exclude-archived", action="store_true")
+    list_parser.add_argument("--limit", type=int, default=200)
+    list_parser.set_defaults(func=cmd_conversation_list)
+
+    info = conv_sub.add_parser("info", help="Retrieve conversation info.")
+    info.add_argument("channel")
+    info.set_defaults(func=cmd_conversation_info)
+
+    history = conv_sub.add_parser("history", help="Fetch conversation history.")
+    history.add_argument("channel")
+    history.add_argument("--limit", type=int, default=50)
+    history.add_argument("--oldest")
+    history.add_argument("--latest")
+    history.add_argument("--inclusive", action="store_true")
+    history.set_defaults(func=cmd_conversation_history)
+
+    replies = conv_sub.add_parser("replies", help="Fetch thread replies.")
+    replies.add_argument("channel")
+    replies.add_argument("ts")
+    replies.add_argument("--limit", type=int, default=100)
+    replies.set_defaults(func=cmd_conversation_replies)
+
+    members = conv_sub.add_parser("members", help="List conversation members.")
+    members.add_argument("channel")
+    members.add_argument("--limit", type=int, default=500)
+    members.set_defaults(func=cmd_conversation_members)
+
+    create = conv_sub.add_parser("create", help="Create a public or private channel.")
+    create.add_argument("name")
+    create.add_argument("--private", action="store_true")
+    create.set_defaults(func=cmd_conversation_create)
+
+    join = conv_sub.add_parser("join", help="Join a public channel.")
+    join.add_argument("channel")
+    join.set_defaults(func=cmd_conversation_join)
+
+    leave = conv_sub.add_parser("leave", help="Leave a conversation.")
+    leave.add_argument("channel")
+    leave.set_defaults(func=cmd_conversation_leave)
+
+    invite = conv_sub.add_parser("invite", help="Invite users to a conversation.")
+    invite.add_argument("channel")
+    invite.add_argument("users", help="Comma-separated user IDs.")
+    invite.set_defaults(func=cmd_conversation_invite)
+
+    kick = conv_sub.add_parser("kick", help="Remove a user from a conversation.")
+    kick.add_argument("channel")
+    kick.add_argument("user")
+    kick.set_defaults(func=cmd_conversation_kick)
+
+    open_dm = conv_sub.add_parser("open", help="Open a DM or MPIM.")
+    open_dm.add_argument("users", help="Comma-separated user IDs.")
+    open_dm.set_defaults(func=cmd_conversation_open)
+
+    archive = conv_sub.add_parser("archive", help="Archive a conversation.")
+    archive.add_argument("channel")
+    archive.set_defaults(func=cmd_conversation_archive)
+
+    unarchive = conv_sub.add_parser("unarchive", help="Unarchive a conversation.")
+    unarchive.add_argument("channel")
+    unarchive.set_defaults(func=cmd_conversation_unarchive)
+
+    rename = conv_sub.add_parser("rename", help="Rename a conversation.")
+    rename.add_argument("channel")
+    rename.add_argument("name")
+    rename.set_defaults(func=cmd_conversation_rename)
+
+    topic = conv_sub.add_parser("topic", help="Set conversation topic.")
+    topic.add_argument("channel")
+    topic.add_argument("topic")
+    topic.set_defaults(func=cmd_conversation_topic)
+
+    purpose = conv_sub.add_parser("purpose", help="Set conversation purpose.")
+    purpose.add_argument("channel")
+    purpose.add_argument("purpose")
+    purpose.set_defaults(func=cmd_conversation_purpose)
+
+    export = conv_sub.add_parser("export", help="Export conversation history, thread replies, and files.")
+    export.add_argument("channel")
+    export.add_argument("--oldest", help="Oldest Slack timestamp to include. Defaults to --days ago.")
+    export.add_argument("--latest", help="Latest Slack timestamp to include. Defaults to now.")
+    export.add_argument("--days", type=float, default=3.0, help="History window in days when --oldest is omitted.")
+    export.add_argument("--output-dir", default="slack-export")
+    export.add_argument("--include-replies", action="store_true", help="Fetch thread replies for messages in the window.")
+    export.add_argument("--download-files", action="store_true", help="Download file/image URLs visible to the token.")
+    export.add_argument("--limit", type=int, help="Maximum parent messages to export.")
+    export.set_defaults(func=cmd_conversation_export)
+
+
+def add_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    chat = subparsers.add_parser("chat", help="Post, update, delete, and schedule messages.")
+    chat_sub = chat.add_subparsers(required=True)
+
+    post = chat_sub.add_parser("post", help="Post a message.")
+    add_message_args(post)
+    post.set_defaults(func=cmd_chat_post)
+
+    ephemeral = chat_sub.add_parser("ephemeral", help="Post an ephemeral message.")
+    add_message_args(ephemeral)
+    ephemeral.add_argument("--user", required=True)
+    ephemeral.set_defaults(func=cmd_chat_ephemeral)
+
+    update = chat_sub.add_parser("update", help="Update a message.")
+    update.add_argument("channel")
+    update.add_argument("ts")
+    add_content_args(update)
+    update.add_argument("--blocks", help="JSON blocks, @file.json, or - for stdin.")
+    update.set_defaults(func=cmd_chat_update)
+
+    delete = chat_sub.add_parser("delete", help="Delete a message.")
+    delete.add_argument("channel")
+    delete.add_argument("ts")
+    delete.set_defaults(func=cmd_chat_delete)
+
+    schedule = chat_sub.add_parser("schedule", help="Schedule a message.")
+    add_message_args(schedule)
+    schedule.add_argument("--post-at", required=True, help="Unix timestamp when Slack should post the message.")
+    schedule.set_defaults(func=cmd_chat_schedule)
+
+    scheduled = chat_sub.add_parser("scheduled", help="List scheduled messages.")
+    scheduled.add_argument("--channel")
+    scheduled.add_argument("--limit", type=int, default=100)
+    scheduled.set_defaults(func=cmd_chat_scheduled)
+
+    unschedule = chat_sub.add_parser("unschedule", help="Delete a scheduled message.")
+    unschedule.add_argument("channel")
+    unschedule.add_argument("scheduled_message_id")
+    unschedule.set_defaults(func=cmd_chat_unschedule)
+
+    permalink = chat_sub.add_parser("permalink", help="Get a message permalink.")
+    permalink.add_argument("channel")
+    permalink.add_argument("ts")
+    permalink.set_defaults(func=cmd_chat_permalink)
+
+
+def add_search_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    search = subparsers.add_parser("search", help="Search Slack messages or files.")
+    search_sub = search.add_subparsers(required=True)
+
+    messages = search_sub.add_parser("messages", help="Search messages.")
+    messages.add_argument("query")
+    messages.add_argument("--count", type=int, default=20)
+    messages.add_argument("--page", type=int, default=1)
+    messages.set_defaults(func=cmd_search_messages)
+
+    files = search_sub.add_parser("files", help="Search files.")
+    files.add_argument("query")
+    files.add_argument("--count", type=int, default=20)
+    files.add_argument("--page", type=int, default=1)
+    files.set_defaults(func=cmd_search_files)
+
+
+def add_user_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    users = subparsers.add_parser("user", aliases=["users"], help="User operations.")
+    user_sub = users.add_subparsers(required=True)
+
+    list_parser = user_sub.add_parser("list", help="List users.")
+    list_parser.add_argument("--limit", type=int, default=500)
+    list_parser.set_defaults(func=cmd_user_list)
+
+    info = user_sub.add_parser("info", help="Retrieve user info.")
+    info.add_argument("user")
+    info.set_defaults(func=cmd_user_info)
+
+    email = user_sub.add_parser("lookup-email", help="Look up user by email.")
+    email.add_argument("email")
+    email.set_defaults(func=cmd_user_lookup_email)
+
+
+def add_file_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    files = subparsers.add_parser("file", aliases=["files"], help="File operations.")
+    files_sub = files.add_subparsers(required=True)
+
+    list_parser = files_sub.add_parser("list", help="List files.")
+    list_parser.add_argument("--channel")
+    list_parser.add_argument("--user")
+    list_parser.add_argument("--ts-from")
+    list_parser.add_argument("--ts-to")
+    list_parser.add_argument("--types")
+    list_parser.add_argument("--limit", type=int, default=100)
+    list_parser.set_defaults(func=cmd_file_list)
+
+    info = files_sub.add_parser("info", help="Retrieve file info.")
+    info.add_argument("file")
+    info.set_defaults(func=cmd_file_info)
+
+    upload = files_sub.add_parser("upload", help="Upload a file using Slack's external upload flow.")
+    upload.add_argument("path")
+    upload.add_argument("--channel")
+    upload.add_argument("--channels")
+    upload.add_argument("--title")
+    upload.add_argument("--initial-comment")
+    upload.add_argument("--thread-ts")
+    upload.add_argument("--alt-txt")
+    upload.add_argument("--snippet-type")
+    upload.set_defaults(func=cmd_file_upload)
+
+    download = files_sub.add_parser("download", help="Download a private Slack file URL.")
+    download.add_argument("url")
+    download.add_argument("output")
+    download.set_defaults(func=cmd_file_download)
+
+    delete = files_sub.add_parser("delete", help="Delete a file.")
+    delete.add_argument("file")
+    delete.set_defaults(func=cmd_file_delete)
+
+
+def add_reaction_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    reactions = subparsers.add_parser("reaction", aliases=["reactions"], help="Reaction operations.")
+    reaction_sub = reactions.add_subparsers(required=True)
+
+    add = reaction_sub.add_parser("add", help="Add a reaction.")
+    add.add_argument("name")
+    add.add_argument("channel")
+    add.add_argument("timestamp")
+    add.set_defaults(func=cmd_reaction_add)
+
+    remove = reaction_sub.add_parser("remove", help="Remove a reaction.")
+    remove.add_argument("name")
+    remove.add_argument("channel")
+    remove.add_argument("timestamp")
+    remove.set_defaults(func=cmd_reaction_remove)
+
+    get = reaction_sub.add_parser("get", help="Get reactions for a message or file.")
+    target = get.add_mutually_exclusive_group(required=True)
+    target.add_argument("--channel")
+    target.add_argument("--file")
+    get.add_argument("--timestamp")
+    get.set_defaults(func=cmd_reaction_get)
+
+
+def add_pin_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    pins = subparsers.add_parser("pin", aliases=["pins"], help="Pin operations.")
+    pin_sub = pins.add_subparsers(required=True)
+
+    add = pin_sub.add_parser("add", help="Pin a message.")
+    add.add_argument("channel")
+    add.add_argument("timestamp")
+    add.set_defaults(func=cmd_pin_add)
+
+    remove = pin_sub.add_parser("remove", help="Remove a pinned message.")
+    remove.add_argument("channel")
+    remove.add_argument("timestamp")
+    remove.set_defaults(func=cmd_pin_remove)
+
+    list_parser = pin_sub.add_parser("list", help="List pinned items.")
+    list_parser.add_argument("channel")
+    list_parser.set_defaults(func=cmd_pin_list)
+
+
+def add_bookmark_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    bookmarks = subparsers.add_parser("bookmark", aliases=["bookmarks"], help="Bookmark operations.")
+    bookmark_sub = bookmarks.add_subparsers(required=True)
+
+    list_parser = bookmark_sub.add_parser("list", help="List channel bookmarks.")
+    list_parser.add_argument("channel")
+    list_parser.set_defaults(func=cmd_bookmark_list)
+
+    add = bookmark_sub.add_parser("add", help="Add a link bookmark.")
+    add.add_argument("channel")
+    add.add_argument("title")
+    add.add_argument("link")
+    add.set_defaults(func=cmd_bookmark_add)
+
+    edit = bookmark_sub.add_parser("edit", help="Edit a bookmark.")
+    edit.add_argument("channel")
+    edit.add_argument("bookmark")
+    edit.add_argument("--title")
+    edit.add_argument("--link")
+    edit.set_defaults(func=cmd_bookmark_edit)
+
+    remove = bookmark_sub.add_parser("remove", help="Remove a bookmark.")
+    remove.add_argument("channel")
+    remove.add_argument("bookmark")
+    remove.set_defaults(func=cmd_bookmark_remove)
+
+
+def add_team_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    team = subparsers.add_parser("team", help="Team information.")
+    team_sub = team.add_subparsers(required=True)
+
+    info = team_sub.add_parser("info", help="Retrieve team info.")
+    info.set_defaults(func=cmd_team_info)
+
+
+def add_emoji_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    emoji = subparsers.add_parser("emoji", help="Emoji operations.")
+    emoji_sub = emoji.add_subparsers(required=True)
+
+    list_parser = emoji_sub.add_parser("list", help="List workspace emoji.")
+    list_parser.set_defaults(func=cmd_emoji_list)
+
+
+def add_content_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--text")
+    group.add_argument("--text-file")
+
+
+def add_message_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("channel")
+    add_content_args(parser)
+    parser.add_argument("--thread-ts")
+    parser.add_argument("--reply-broadcast", action="store_true")
+    parser.add_argument("--blocks", help="JSON blocks, @file.json, or - for stdin.")
+    parser.add_argument("--unfurl-links", choices=["true", "false"])
+    parser.add_argument("--unfurl-media", choices=["true", "false"])
+
+
+def cmd_setup(_client: SlackClient | None, args: argparse.Namespace) -> int:
+    if args.manifest_only:
+        print(SLACK_USER_APP_MANIFEST_YAML.rstrip())
+    elif args.env_only:
+        print(build_slack_env_setup_text().rstrip())
+    else:
+        print(build_slack_setup_text().rstrip())
+    return 0
+
+
+def cmd_me(client: SlackClient, _args: argparse.Namespace) -> int:
+    emit_json(client.post("auth.test"))
+    return 0
+
+
+def cmd_api(client: SlackClient, args: argparse.Namespace) -> int:
+    params = read_json_arg(args.data) if args.data else {}
+    if not isinstance(params, dict):
+        raise ValueError("--data must decode to a JSON object.")
+    params.update(parse_pairs(args.param))
+
+    if args.paginate:
+        emit_json(
+            client.collect_cursor(
+                args.method,
+                params,
+                result_key=args.result_key,
+                limit=args.limit,
+                http_method=args.http_method,
+            )
+        )
+    else:
+        emit_json(client.request(args.method, params, http_method=args.http_method, form=args.form))
+    return 0
+
+
+def cmd_conversation_list(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {"types": args.types, "exclude_archived": args.exclude_archived}
+    emit_json(client.collect_cursor("conversations.list", params, result_key="channels", limit=args.limit))
+    return 0
+
+
+def cmd_conversation_info(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("conversations.info", {"channel": args.channel}))
+    return 0
+
+
+def cmd_conversation_history(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {
+        "channel": args.channel,
+        "oldest": args.oldest,
+        "latest": args.latest,
+        "inclusive": args.inclusive,
+    }
+    emit_json(client.collect_cursor("conversations.history", params, result_key="messages", limit=args.limit, http_method="POST"))
+    return 0
+
+
+def cmd_conversation_replies(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {"channel": args.channel, "ts": args.ts}
+    emit_json(client.collect_cursor("conversations.replies", params, result_key="messages", limit=args.limit, http_method="POST"))
+    return 0
+
+
+def cmd_conversation_members(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.collect_cursor("conversations.members", {"channel": args.channel}, result_key="members", limit=args.limit))
+    return 0
+
+
+def cmd_conversation_create(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.create", {"name": args.name, "is_private": args.private}))
+    return 0
+
+
+def cmd_conversation_join(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.join", {"channel": args.channel}))
+    return 0
+
+
+def cmd_conversation_leave(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.leave", {"channel": args.channel}))
+    return 0
+
+
+def cmd_conversation_invite(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.invite", {"channel": args.channel, "users": args.users}))
+    return 0
+
+
+def cmd_conversation_kick(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.kick", {"channel": args.channel, "user": args.user}))
+    return 0
+
+
+def cmd_conversation_open(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.open", {"users": args.users}))
+    return 0
+
+
+def cmd_conversation_archive(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.archive", {"channel": args.channel}))
+    return 0
+
+
+def cmd_conversation_unarchive(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.unarchive", {"channel": args.channel}))
+    return 0
+
+
+def cmd_conversation_rename(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.rename", {"channel": args.channel, "name": args.name}))
+    return 0
+
+
+def cmd_conversation_topic(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.setTopic", {"channel": args.channel, "topic": args.topic}))
+    return 0
+
+
+def cmd_conversation_purpose(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("conversations.setPurpose", {"channel": args.channel, "purpose": args.purpose}))
+    return 0
+
+
+def cmd_conversation_export(client: SlackClient, args: argparse.Namespace) -> int:
+    latest = args.latest
+    oldest = args.oldest or str(time.time() - args.days * 86400)
+    output_dir = Path(args.output_dir).expanduser()
+    files_dir = output_dir / "files"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.download_files:
+        files_dir.mkdir(parents=True, exist_ok=True)
+
+    channel_info = client.get("conversations.info", {"channel": args.channel}).get("channel", {})
+    params = {
+        "channel": args.channel,
+        "oldest": oldest,
+        "latest": latest,
+        "inclusive": True,
+    }
+    messages = client.collect_cursor(
+        "conversations.history",
+        params,
+        result_key="messages",
+        limit=args.limit,
+        http_method="POST",
+    )
+    messages = sorted(messages, key=lambda message: float(message.get("ts", "0")))
+
+    if args.include_replies:
+        for message in messages:
+            if int(message.get("reply_count") or 0) <= 0:
+                continue
+            replies = client.collect_cursor(
+                "conversations.replies",
+                {"channel": args.channel, "ts": message["ts"], "oldest": oldest, "latest": latest, "inclusive": True},
+                result_key="messages",
+                http_method="POST",
+            )
+            message["replies"] = [
+                reply for reply in sorted(replies, key=lambda item: float(item.get("ts", "0"))) if reply.get("ts") != message.get("ts")
+            ]
+
+    files = extract_message_files(messages)
+    if args.download_files:
+        for file_info in files:
+            url = file_info.get("url_private_download") or file_info.get("url_private")
+            if not url:
+                file_info["_download_error"] = "No private download URL available."
+                continue
+            filename = safe_file_name(file_info.get("name") or file_info.get("title") or file_info.get("id") or "slack-file")
+            output_path = files_dir / f"{safe_file_name(file_info.get('_message_ts', 'unknown'))}_{file_info.get('id', 'file')}_{filename}"
+            try:
+                download_private_url(client, url, output_path)
+                file_info["_download_path"] = str(output_path)
+            except SlackError as error:
+                file_info["_download_error"] = str(error)
+
+    user_names = build_user_name_map(client, messages)
+    export_data = {
+        "channel": channel_info,
+        "oldest": oldest,
+        "oldest_datetime": slack_ts_to_local(oldest),
+        "latest": latest,
+        "latest_datetime": slack_ts_to_local(latest) if latest else "Slack API default: now",
+        "message_count": count_messages(messages, include_replies=True),
+        "parent_message_count": len(messages),
+        "file_count": len(files),
+        "messages": messages,
+        "files": files,
+    }
+
+    (output_dir / "history.json").write_text(json.dumps(export_data, indent=2, ensure_ascii=False), encoding="utf-8")
+    (output_dir / "files.json").write_text(json.dumps(files, indent=2, ensure_ascii=False), encoding="utf-8")
+    (output_dir / "messages.md").write_text(render_messages_markdown(channel_info, messages, user_names, files), encoding="utf-8")
+    print(f"Wrote {output_dir / 'history.json'}")
+    print(f"Wrote {output_dir / 'messages.md'}")
+    print(f"Wrote {output_dir / 'files.json'}")
+    if args.download_files:
+        print(f"Wrote downloads under {files_dir}")
+    return 0
+
+
+def cmd_chat_post(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("chat.postMessage", message_body(args)))
+    return 0
+
+
+def cmd_chat_ephemeral(client: SlackClient, args: argparse.Namespace) -> int:
+    body = message_body(args)
+    body["user"] = args.user
+    emit_json(client.post("chat.postEphemeral", body))
+    return 0
+
+
+def cmd_chat_update(client: SlackClient, args: argparse.Namespace) -> int:
+    body = {"channel": args.channel, "ts": args.ts, "text": read_text_arg(args)}
+    if args.blocks:
+        body["blocks"] = read_json_arg(args.blocks)
+    emit_json(client.post("chat.update", body))
+    return 0
+
+
+def cmd_chat_delete(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("chat.delete", {"channel": args.channel, "ts": args.ts}))
+    return 0
+
+
+def cmd_chat_schedule(client: SlackClient, args: argparse.Namespace) -> int:
+    body = message_body(args)
+    body["post_at"] = int(args.post_at)
+    emit_json(client.post("chat.scheduleMessage", body))
+    return 0
+
+
+def cmd_chat_scheduled(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {"channel": args.channel}
+    emit_json(client.collect_cursor("chat.scheduledMessages.list", params, result_key="scheduled_messages", limit=args.limit))
+    return 0
+
+
+def cmd_chat_unschedule(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(
+        client.post(
+            "chat.deleteScheduledMessage",
+            {"channel": args.channel, "scheduled_message_id": args.scheduled_message_id},
+        )
+    )
+    return 0
+
+
+def cmd_chat_permalink(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("chat.getPermalink", {"channel": args.channel, "message_ts": args.ts}))
+    return 0
+
+
+def cmd_search_messages(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("search.messages", {"query": args.query, "count": args.count, "page": args.page}))
+    return 0
+
+
+def cmd_search_files(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("search.files", {"query": args.query, "count": args.count, "page": args.page}))
+    return 0
+
+
+def cmd_user_list(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.collect_cursor("users.list", result_key="members", limit=args.limit))
+    return 0
+
+
+def cmd_user_info(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("users.info", {"user": args.user}))
+    return 0
+
+
+def cmd_user_lookup_email(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("users.lookupByEmail", {"email": args.email}))
+    return 0
+
+
+def cmd_file_list(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {
+        "channel": args.channel,
+        "user": args.user,
+        "ts_from": args.ts_from,
+        "ts_to": args.ts_to,
+        "types": args.types,
+    }
+    emit_json(client.collect_cursor("files.list", params, result_key="files", limit=args.limit))
+    return 0
+
+
+def cmd_file_info(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("files.info", {"file": args.file}))
+    return 0
+
+
+def cmd_file_upload(client: SlackClient, args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser()
+    data = path.read_bytes()
+    filename = path.name
+
+    ticket = client.get(
+        "files.getUploadURLExternal",
+        {
+            "filename": filename,
+            "length": len(data),
+            "alt_txt": args.alt_txt,
+            "snippet_type": args.snippet_type,
+        },
+    )
+    upload_url = ticket["upload_url"]
+    file_id = ticket["file_id"]
+    upload_file_bytes(upload_url, filename, data)
+
+    complete_body: dict[str, Any] = {
+        "files": [{"id": file_id, "title": args.title or filename}],
+        "channel_id": args.channel,
+        "channels": args.channels,
+        "initial_comment": args.initial_comment,
+        "thread_ts": args.thread_ts,
+    }
+    emit_json(client.post("files.completeUploadExternal", complete_body))
+    return 0
+
+
+def cmd_file_download(client: SlackClient, args: argparse.Namespace) -> int:
+    request = urllib.request.Request(args.url, headers={"Authorization": f"Bearer {client.token}"})
+    try:
+        with urllib.request.urlopen(request) as response:
+            Path(args.output).expanduser().write_bytes(response.read())
+    except urllib.error.HTTPError as error:
+        raise SlackError("file.download", f"HTTP {error.code} {error.reason}") from error
+    print(f"Wrote {args.output}")
+    return 0
+
+
+def cmd_file_delete(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("files.delete", {"file": args.file}))
+    return 0
+
+
+def cmd_reaction_add(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("reactions.add", {"name": args.name, "channel": args.channel, "timestamp": args.timestamp}))
+    return 0
+
+
+def cmd_reaction_remove(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("reactions.remove", {"name": args.name, "channel": args.channel, "timestamp": args.timestamp}))
+    return 0
+
+
+def cmd_reaction_get(client: SlackClient, args: argparse.Namespace) -> int:
+    params = {"channel": args.channel, "file": args.file, "timestamp": args.timestamp}
+    emit_json(client.get("reactions.get", params))
+    return 0
+
+
+def cmd_pin_add(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("pins.add", {"channel": args.channel, "timestamp": args.timestamp}))
+    return 0
+
+
+def cmd_pin_remove(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("pins.remove", {"channel": args.channel, "timestamp": args.timestamp}))
+    return 0
+
+
+def cmd_pin_list(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("pins.list", {"channel": args.channel}))
+    return 0
+
+
+def cmd_bookmark_list(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.get("bookmarks.list", {"channel_id": args.channel}))
+    return 0
+
+
+def cmd_bookmark_add(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(
+        client.post(
+            "bookmarks.add",
+            {"channel_id": args.channel, "title": args.title, "type": "link", "link": args.link},
+        )
+    )
+    return 0
+
+
+def cmd_bookmark_edit(client: SlackClient, args: argparse.Namespace) -> int:
+    body = {"channel_id": args.channel, "bookmark_id": args.bookmark, "title": args.title, "link": args.link}
+    emit_json(client.post("bookmarks.edit", body))
+    return 0
+
+
+def cmd_bookmark_remove(client: SlackClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("bookmarks.remove", {"channel_id": args.channel, "bookmark_id": args.bookmark}))
+    return 0
+
+
+def cmd_team_info(client: SlackClient, _args: argparse.Namespace) -> int:
+    emit_json(client.get("team.info"))
+    return 0
+
+
+def cmd_emoji_list(client: SlackClient, _args: argparse.Namespace) -> int:
+    emit_json(client.get("emoji.list"))
+    return 0
+
+
+def normalize_method(method: str) -> str:
+    method = method.strip()
+    if method.startswith(API_BASE):
+        method = method[len(API_BASE) :]
+    if method.startswith("/api/"):
+        method = method[len("/api/") :]
+    return method.lstrip("/")
+
+
+def clean_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in params.items() if value is not None}
+
+
+def first_list_key(response: dict[str, Any]) -> str | None:
+    skip = {"ok", "response_metadata", "warning", "needed", "provided"}
+    for key, value in response.items():
+        if key not in skip and isinstance(value, list):
+            return key
+    return None
+
+
+def load_env_files(paths: list[Path]) -> None:
+    for path in paths:
+        if path.exists():
+            load_env_file(path)
+
+
+def load_env_file(path: Path) -> None:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = strip_env_quotes(value.strip())
+
+
+def strip_env_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def build_slack_setup_text() -> str:
+    return f"""Slack access is not set up for slack-cli.
+
+This CLI is designed to use a Slack user OAuth token when it should act as you.
+Slack App Manifests can declare the OAuth scopes up front, so you do not need to
+click each scope manually. Slack still requires an OAuth approval/install step
+before it will issue an xoxp user token.
+
+1. Create or update a Slack app from this manifest:
+
+```yaml
+{SLACK_USER_APP_MANIFEST_YAML.rstrip()}
+```
+
+Use one of these setup paths:
+
+- UI path: open https://api.slack.com/apps, choose "Create New App", then
+  "From an app manifest", and paste the YAML above.
+- API path: generate a short-lived configuration token from the Slack app
+  settings page, then use Slack's apps.manifest.create or apps.manifest.update
+  API with the YAML above.
+
+2. Configure OAuth:
+
+- In the app's Basic Information page, copy the Client ID.
+- Keep or replace the manifest redirect URL with a redirect URL you control.
+- Start OAuth with a URL shaped like this, replacing CLIENT_ID and REDIRECT_URI:
+
+https://slack.com/oauth/v2/authorize?client_id=CLIENT_ID&user_scope={slack_user_scope_csv()}&redirect_uri=REDIRECT_URI
+
+3. Finish OAuth:
+
+- Approve the requested user scopes as the Slack user the CLI should act as.
+- Exchange the returned code for a token with oauth.v2.access if you are
+  running your own callback handler, or copy the resulting User OAuth Token
+  from the Slack app settings after installation.
+- The token should start with xoxp-.
+
+{build_slack_env_setup_text().rstrip()}
+
+Reference docs:
+- App manifests: https://docs.slack.dev/app-manifests/
+- Manifest reference: https://docs.slack.dev/reference/app-manifest
+- Manifest APIs: https://docs.slack.dev/reference/methods/apps.manifest.create/
+- OAuth v2: https://docs.slack.dev/authentication/installing-with-oauth
+- Slack token types: https://docs.slack.dev/authentication/tokens/
+"""
+
+
+def build_slack_env_setup_text() -> str:
+    return """4. Store the token outside this repository:
+
+```sh
+mkdir -p ~/.slack
+chmod 700 ~/.slack
+$EDITOR ~/.slack/env
+chmod 600 ~/.slack/env
+```
+
+Put this in ~/.slack/env:
+
+```sh
+SLACK_USER_TOKEN=xoxp-your-user-token-here
+```
+
+Then verify access:
+
+```sh
+uv run scripts/slack-cli me
+```
+"""
+
+
+def slack_user_scope_csv() -> str:
+    scopes = []
+    in_user_scope = False
+    for line in SLACK_USER_APP_MANIFEST_YAML.splitlines():
+        stripped = line.strip()
+        if stripped == "user:":
+            in_user_scope = True
+            continue
+        if in_user_scope:
+            if not stripped:
+                continue
+            if not stripped.startswith("- "):
+                break
+            scopes.append(stripped[2:])
+    return ",".join(scopes)
+
+
+def is_auth_setup_error(error: SlackError) -> bool:
+    slack_error = error.response.get("error")
+    return isinstance(slack_error, str) and slack_error in AUTH_SETUP_ERRORS
+
+
+def read_json_arg(value: str) -> Any:
+    if value == "-":
+        return json.loads(sys.stdin.read())
+    if value.startswith("@"):
+        return json.loads(Path(value[1:]).expanduser().read_text(encoding="utf-8"))
+    return json.loads(value)
+
+
+def read_text_arg(args: argparse.Namespace) -> str:
+    if getattr(args, "text_file", None):
+        return Path(args.text_file).expanduser().read_text(encoding="utf-8")
+    return args.text
+
+
+def parse_pairs(pairs: list[str]) -> dict[str, str]:
+    parsed = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator:
+            raise ValueError(f"Invalid parameter {pair!r}; expected key=value.")
+        parsed[key] = value
+    return parsed
+
+
+def message_body(args: argparse.Namespace) -> dict[str, Any]:
+    body: dict[str, Any] = {"channel": args.channel, "text": read_text_arg(args)}
+    if args.thread_ts:
+        body["thread_ts"] = args.thread_ts
+    if args.reply_broadcast:
+        body["reply_broadcast"] = True
+    if args.blocks:
+        body["blocks"] = read_json_arg(args.blocks)
+    if args.unfurl_links:
+        body["unfurl_links"] = args.unfurl_links == "true"
+    if args.unfurl_media:
+        body["unfurl_media"] = args.unfurl_media == "true"
+    return body
+
+
+def extract_message_files(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for message in messages:
+        append_files_from_message(files, message)
+        for reply in message.get("replies", []):
+            append_files_from_message(files, reply)
+    return files
+
+
+def append_files_from_message(files: list[dict[str, Any]], message: dict[str, Any]) -> None:
+    for file_info in message.get("files", []) or []:
+        if not isinstance(file_info, dict):
+            continue
+        item = dict(file_info)
+        item["_message_ts"] = message.get("ts")
+        item["_thread_ts"] = message.get("thread_ts")
+        files.append(item)
+
+
+def build_user_name_map(client: SlackClient, messages: list[dict[str, Any]]) -> dict[str, str]:
+    users = sorted(collect_user_ids(messages))
+    names: dict[str, str] = {}
+    for user_id in users:
+        try:
+            user = client.get("users.info", {"user": user_id}).get("user", {})
+            profile = user.get("profile", {}) or {}
+            names[user_id] = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("real_name")
+                or user.get("name")
+                or user_id
+            )
+        except SlackError:
+            names[user_id] = user_id
+    return names
+
+
+def collect_user_ids(messages: list[dict[str, Any]]) -> set[str]:
+    users: set[str] = set()
+    for message in messages:
+        append_user_id(users, message)
+        for reply in message.get("replies", []):
+            append_user_id(users, reply)
+    return users
+
+
+def append_user_id(users: set[str], message: dict[str, Any]) -> None:
+    user = message.get("user")
+    if isinstance(user, str) and user:
+        users.add(user)
+
+
+def count_messages(messages: list[dict[str, Any]], include_replies: bool = False) -> int:
+    total = len(messages)
+    if include_replies:
+        total += sum(len(message.get("replies", [])) for message in messages)
+    return total
+
+
+def render_messages_markdown(
+    channel: dict[str, Any],
+    messages: list[dict[str, Any]],
+    user_names: dict[str, str],
+    files: list[dict[str, Any]],
+) -> str:
+    name = channel.get("name") or channel.get("id") or "conversation"
+    lines = [f"# Slack export: #{name}", ""]
+    files_by_message: dict[str, list[dict[str, Any]]] = {}
+    for file_info in files:
+        files_by_message.setdefault(file_info.get("_message_ts", ""), []).append(file_info)
+
+    for message in messages:
+        lines.extend(render_one_message(message, user_names, files_by_message))
+        for reply in message.get("replies", []):
+            lines.extend(render_one_message(reply, user_names, files_by_message, indent="  "))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_one_message(
+    message: dict[str, Any],
+    user_names: dict[str, str],
+    files_by_message: dict[str, list[dict[str, Any]]],
+    indent: str = "",
+) -> list[str]:
+    ts = message.get("ts", "")
+    user = user_names.get(message.get("user", ""), message.get("username") or message.get("user") or message.get("bot_id") or "unknown")
+    text = normalize_slack_text(message.get("text") or "")
+    prefix = f"{indent}- **{slack_ts_to_local(ts)}** — **{user}**"
+    lines = [prefix]
+    if text:
+        for line in text.splitlines():
+            lines.append(f"{indent}  {line}")
+
+    for attachment in message.get("attachments", []) or []:
+        fallback = attachment.get("fallback") or attachment.get("title") or attachment.get("text")
+        if fallback:
+            lines.append(f"{indent}  Attachment: {fallback}")
+
+    for file_info in files_by_message.get(ts, []):
+        title = file_info.get("title") or file_info.get("name") or file_info.get("id") or "file"
+        mimetype = file_info.get("mimetype") or file_info.get("filetype") or "file"
+        path = file_info.get("_download_path")
+        if path:
+            lines.append(f"{indent}  File: [{title}]({path}) ({mimetype})")
+        else:
+            lines.append(f"{indent}  File: {title} ({mimetype})")
+    return lines + [""]
+
+
+def normalize_slack_text(text: str) -> str:
+    text = re.sub(r"<(https?://[^>|]+)\|([^>]+)>", r"[\2](\1)", text)
+    text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+    text = re.sub(r"<@([A-Z0-9]+)>", r"@\1", text)
+    text = re.sub(r"<#([A-Z0-9]+)\|([^>]+)>", r"#\2", text)
+    return text
+
+
+def slack_ts_to_local(ts: str | float | int) -> str:
+    try:
+        timestamp = float(ts)
+    except (TypeError, ValueError):
+        return str(ts)
+    value = dt.datetime.fromtimestamp(timestamp).astimezone()
+    return value.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def safe_file_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    return cleaned.strip("._") or "file"
+
+
+def emit_json(value: Any) -> None:
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def upload_file_bytes(upload_url: str, filename: str, data: bytes) -> None:
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    request = urllib.request.Request(
+        upload_url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": content_type, "Content-Length": str(len(data))},
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        payload = error.read().decode("utf-8", errors="replace")
+        raise SlackError("files.uploadBytes", f"HTTP {error.code} {error.reason}: {payload}") from error
+
+
+def download_private_url(client: SlackClient, url: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {client.token}"})
+    try:
+        with urllib.request.urlopen(request) as response:
+            output_path.write_bytes(response.read())
+    except urllib.error.HTTPError as error:
+        payload = error.read().decode("utf-8", errors="replace")
+        raise SlackError("file.download", f"HTTP {error.code} {error.reason}: {payload}") from error
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
