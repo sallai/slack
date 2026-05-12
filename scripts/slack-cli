@@ -36,6 +36,13 @@ AUTH_SETUP_ERRORS = {
     "token_expired",
     "token_revoked",
 }
+EXIT_RUNTIME = 1
+EXIT_USAGE = 2
+EXIT_AUTH = 3
+EXIT_PERMISSION = 4
+EXIT_DOMAIN = 5
+OUTPUT_FORMAT = "human"
+STARTED_AT = time.perf_counter()
 SLACK_USER_APP_MANIFEST_YAML = """display_information:
   name: Local Slack CLI
   description: Local command-line Slack access using a user OAuth token
@@ -183,44 +190,55 @@ class SlackClient:
 
 
 def main() -> int:
+    global OUTPUT_FORMAT, STARTED_AT
+    STARTED_AT = time.perf_counter()
     args = build_parser().parse_args()
+    OUTPUT_FORMAT = args.output
 
     try:
+        if args.schema:
+            emit_json(build_schema())
+            return 0
+        if not hasattr(args, "func"):
+            build_parser().print_usage(sys.stderr)
+            return EXIT_USAGE
         if not getattr(args, "requires_auth", True):
             return args.func(None, args)
 
         load_env_files([Path(path).expanduser() for path in args.env_file] if args.env_file else SLACK_ENV_FILES)
         token = os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_USER_TOKEN") or os.environ.get("SLACK_TOKEN")
         if not token:
-            print(build_slack_setup_text(), file=sys.stdout, flush=True)
-            return 1
+            return emit_error("missing_credentials", "Slack credentials are not configured.", EXIT_AUTH, setup_text=build_slack_setup_text())
 
         client = SlackClient(token)
         return args.func(client, args)
     except (SlackError, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
         if isinstance(error, SlackError) and is_auth_setup_error(error):
-            print(str(error), file=sys.stderr, flush=True)
-            print(build_slack_setup_text(), file=sys.stdout, flush=True)
-            return 1
-        print(str(error), file=sys.stderr, flush=True)
-        return 1
+            return emit_error(slack_error_code(error), str(error), slack_error_exit_code(error), setup_text=build_slack_setup_text())
+        return emit_error("runtime_error", str(error), EXIT_RUNTIME)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slack-cli",
-        description="Single-file Slack Web API CLI using ~/.slack/env credentials.",
+        description=(
+            "Single-file Slack Web API CLI using ~/.slack/env credentials. "
+            "Exit codes: 0 success, 1 runtime/API, 2 usage, 3 auth, 4 permission, 5 domain."
+        ),
     )
     parser.add_argument(
         "--env-file",
         action="append",
         help="Credential env file to load. Defaults to ~/.slack/env and compatible fallbacks.",
     )
-    subparsers = parser.add_subparsers(required=True)
+    parser.add_argument("--output", choices=["human", "json"], default="human", help="Output format. JSON mode emits one envelope object.")
+    parser.add_argument("--schema", action="store_true", help="Print machine-readable command schema as JSON.")
+    subparsers = parser.add_subparsers()
 
     add_setup_parser(subparsers)
     add_me_parser(subparsers)
     add_api_parser(subparsers)
+    add_schema_parser(subparsers)
     add_conversation_parser(subparsers)
     add_chat_parser(subparsers)
     add_search_parser(subparsers)
@@ -259,6 +277,11 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     parser.add_argument("--result-key", help="Result list key for pagination, e.g. channels, messages, files.")
     parser.add_argument("--limit", type=int, help="Maximum total paginated results.")
     parser.set_defaults(func=cmd_api)
+
+
+def add_schema_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("schema", help="Print machine-readable command schema.")
+    parser.set_defaults(func=cmd_schema, requires_auth=False)
 
 
 def add_conversation_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -578,11 +601,15 @@ def add_message_args(parser: argparse.ArgumentParser) -> None:
 
 def cmd_setup(_client: SlackClient | None, args: argparse.Namespace) -> int:
     if args.manifest_only:
-        print(SLACK_USER_APP_MANIFEST_YAML.rstrip(), flush=True)
+        text = SLACK_USER_APP_MANIFEST_YAML.rstrip()
     elif args.env_only:
-        print(build_slack_env_setup_text().rstrip(), flush=True)
+        text = build_slack_env_setup_text().rstrip()
     else:
-        print(build_slack_setup_text().rstrip(), flush=True)
+        text = build_slack_setup_text().rstrip()
+    if OUTPUT_FORMAT == "json":
+        emit_json({"text": text})
+    else:
+        print(text, flush=True)
     return 0
 
 
@@ -609,6 +636,11 @@ def cmd_api(client: SlackClient, args: argparse.Namespace) -> int:
         )
     else:
         emit_json(client.request(args.method, params, http_method=args.http_method, form=args.form))
+    return 0
+
+
+def cmd_schema(_client: SlackClient | None, _args: argparse.Namespace) -> int:
+    emit_json(build_schema())
     return 0
 
 
@@ -771,11 +803,26 @@ def cmd_conversation_export(client: SlackClient, args: argparse.Namespace) -> in
     (output_dir / "history.json").write_text(json.dumps(export_data, indent=2, ensure_ascii=False), encoding="utf-8")
     (output_dir / "files.json").write_text(json.dumps(files, indent=2, ensure_ascii=False), encoding="utf-8")
     (output_dir / "messages.md").write_text(render_messages_markdown(channel_info, messages, user_names, files), encoding="utf-8")
-    print(f"Wrote {output_dir / 'history.json'}", flush=True)
-    print(f"Wrote {output_dir / 'messages.md'}", flush=True)
-    print(f"Wrote {output_dir / 'files.json'}", flush=True)
+    print(f"Wrote {output_dir / 'history.json'}", file=sys.stderr, flush=True)
+    print(f"Wrote {output_dir / 'messages.md'}", file=sys.stderr, flush=True)
+    print(f"Wrote {output_dir / 'files.json'}", file=sys.stderr, flush=True)
     if args.download_files:
-        print(f"Wrote downloads under {files_dir}", flush=True)
+        print(f"Wrote downloads under {files_dir}", file=sys.stderr, flush=True)
+    if OUTPUT_FORMAT == "json":
+        emit_json(
+            {
+                "output_dir": str(output_dir),
+                "written": {
+                    "history": str(output_dir / "history.json"),
+                    "messages": str(output_dir / "messages.md"),
+                    "files": str(output_dir / "files.json"),
+                    "downloads_dir": str(files_dir) if args.download_files else None,
+                },
+                "message_count": export_data["message_count"],
+                "parent_message_count": export_data["parent_message_count"],
+                "file_count": export_data["file_count"],
+            }
+        )
     return 0
 
 
@@ -910,7 +957,9 @@ def cmd_file_download(client: SlackClient, args: argparse.Namespace) -> int:
             Path(args.output).expanduser().write_bytes(response.read())
     except urllib.error.HTTPError as error:
         raise SlackError("file.download", f"HTTP {error.code} {error.reason}") from error
-    print(f"Wrote {args.output}", flush=True)
+    print(f"Wrote {args.output}", file=sys.stderr, flush=True)
+    if OUTPUT_FORMAT == "json":
+        emit_json({"output": str(Path(args.output).expanduser())})
     return 0
 
 
@@ -1302,7 +1351,96 @@ def safe_file_name(value: str) -> str:
 
 
 def emit_json(value: Any) -> None:
-    print(json.dumps(value, indent=2, ensure_ascii=False), flush=True)
+    if OUTPUT_FORMAT == "json":
+        payload = {
+            "status": "success",
+            "metadata": {"execution_time_ms": elapsed_ms(), "records_processed": count_records(value)},
+            "data": value,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
+    else:
+        print(json.dumps(value, indent=2, ensure_ascii=False), flush=True)
+
+
+def emit_error(code: str, message: str, exit_code: int, *, retryable: bool = False, setup_text: str | None = None) -> int:
+    if setup_text:
+        print(setup_text, file=sys.stderr, flush=True)
+    if OUTPUT_FORMAT == "json":
+        payload = {
+            "status": "error",
+            "metadata": {"execution_time_ms": elapsed_ms()},
+            "error": {"code": code, "message": message, "retryable": retryable},
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
+    else:
+        print(message, file=sys.stderr, flush=True)
+    return exit_code
+
+
+def elapsed_ms() -> int:
+    return int((time.perf_counter() - STARTED_AT) * 1000)
+
+
+def count_records(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("channels", "messages", "files", "members", "items", "scheduled_messages", "data"):
+            item = value.get(key)
+            if isinstance(item, list):
+                return len(item)
+        return 1
+    return 1 if value is not None else 0
+
+
+def slack_error_code(error: SlackError) -> str:
+    response_error = error.response.get("error")
+    return str(response_error or "auth_error")
+
+
+def slack_error_exit_code(error: SlackError) -> int:
+    code = slack_error_code(error)
+    if code == "missing_scope":
+        return EXIT_PERMISSION
+    return EXIT_AUTH
+
+
+def build_schema() -> dict[str, Any]:
+    return {
+        "tool": "slack-cli",
+        "output": {
+            "formats": ["human", "json"],
+            "default": "human",
+            "json_envelope": {"status": "success|error", "metadata": "object", "data": "any", "error": "object"},
+        },
+        "credentials": {
+            "env_files": [str(path) for path in SLACK_ENV_FILES],
+            "token_env_vars": ["SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_TOKEN"],
+        },
+        "exit_codes": {
+            "0": "success",
+            "1": "runtime/API/network/fatal error",
+            "2": "CLI syntax or argument error",
+            "3": "missing or invalid credentials",
+            "4": "permission denied or missing scopes",
+            "5": "validation, not found, conflict, or domain-specific failure",
+        },
+        "commands": {
+            "setup": {"auth": False, "args": ["--manifest-only", "--env-only"]},
+            "me": {"auth": True},
+            "api": {"auth": True, "args": ["http_method", "method", "--data", "--param", "--form", "--paginate", "--result-key", "--limit"]},
+            "conversation": {"auth": True, "aliases": ["conversations", "channel"], "subcommands": ["list", "info", "history", "replies", "members", "create", "join", "leave", "invite", "kick", "open", "archive", "unarchive", "rename", "topic", "purpose", "export"]},
+            "chat": {"auth": True, "subcommands": ["post", "ephemeral", "update", "delete", "schedule", "scheduled", "unschedule", "permalink"]},
+            "search": {"auth": True, "subcommands": ["messages", "files"]},
+            "user": {"auth": True, "aliases": ["users"], "subcommands": ["list", "info", "lookup-email"]},
+            "file": {"auth": True, "aliases": ["files"], "subcommands": ["list", "info", "upload", "download", "delete"]},
+            "reaction": {"auth": True, "aliases": ["reactions"], "subcommands": ["add", "remove", "get"]},
+            "pin": {"auth": True, "aliases": ["pins"], "subcommands": ["add", "remove", "list"]},
+            "bookmark": {"auth": True, "aliases": ["bookmarks"], "subcommands": ["list", "add", "edit", "remove"]},
+            "team": {"auth": True, "subcommands": ["info"]},
+            "emoji": {"auth": True, "subcommands": ["list"]},
+        },
+    }
 
 
 def upload_file_bytes(upload_url: str, filename: str, data: bytes) -> None:
